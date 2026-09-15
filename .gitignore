@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Runtime artifacts — this plugin keeps its registry and boot trace under
+# $DSH_HOME/data/dsh-preset-agent-manager/, never inside the package.
+*.log
+*.tmp
+*.corrupt-*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

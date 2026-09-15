@@ -1,0 +1,21 @@
+# dsh-preset-agent-manager bundle patch.
+#
+# Applied when this package is named in a profile's `dsh.profile.bundles`, or
+# copy the `insert` block below into the profile's own cordis.patch.yml (the
+# recommended path: a custom profile declares `patchReload: live`, so the row
+# activates without restarting the profile).
+#
+# `config.rev` selects the implementation revision loaded from `lib/impl.js`;
+# bump it to roll the host half forward without a restart. A bump also makes the
+# client-modules scanner snapshot lib/client.js again, so a browser-side change
+# needs only a page refresh after it.
+#
+# `dsh.client` on this package turns the row into a browser row as well: the
+# client-modules node half scans enabled Loader entries and serves ./client as
+# the browser bundle.
+
+- insert:
+    - id: preset-agent-manager
+      name: 'dsh-preset-agent-manager'
+      config:
+        rev: '16'
