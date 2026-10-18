@@ -1,6 +1,6 @@
 {
   "name": "dsh-preset-agent-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Preset agent manager for DeepSeek Harness: a sidebar admin panel plus the preset_agent_dispatch delegation tool over per-agent plugin whitelists.",
   "type": "module",
   "main": "lib/index.js",
@@ -32,7 +32,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/dsh-scope": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2"
   },
   "keywords": [
     "deepseek-harness",

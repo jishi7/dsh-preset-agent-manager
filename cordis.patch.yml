@@ -18,4 +18,4 @@
     - id: preset-agent-manager
       name: 'dsh-preset-agent-manager'
       config:
-        rev: '16'
+        rev: '23'

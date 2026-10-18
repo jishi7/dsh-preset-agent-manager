@@ -13,9 +13,19 @@ DSH（DeepSeek Harness）插件：**预设智能体管理器**。
 | 侧边栏底部入口 + 全屏管理面板 | 浏览器半注册在 `sidebar.footer.action` 与 `shell.overlay` |
 | 创建 / 编辑 / 删除预设智能体 | 面板；删除需二次确认并显示当前活跃子会话数 |
 | 插件白名单 | 从当前 profile 的 Loader 行与各 preset 组合行中勾选，逐行显示启用状态、fiber 阶段、不可用原因 |
-| 工具白名单（严格生效） | 勾选后写入 `toolWhitelist`，运行时先作为子会话的 `toolFilter.allow`，再在子会话作用域内加一道 `tools.guard` 兜底 |
+| 工具白名单（严格生效） | 勾选后写入 `toolWhitelist`，运行时在子会话作用域内先 `tools.restrict()` 掩码、再 `tools.guard()` 兜底 |
 | 模型工具 | `preset_agent_dispatch(agent_id, task)`、`preset_agent_admin(action, …)` |
 | 持久化 | `$DSH_HOME/data/dsh-preset-agent-manager/agents.json`（原子写入 + 损坏文件自动旁置） |
+
+## 兼容性
+
+| 项目 | 说明 |
+|---|---|
+| 目标运行时 | **DSH `0.2.1-rc.2`**（桌面运行时；`@deepseek-ai/dsh-tools` 0.2.1-rc.2） |
+| Host 实现版本 | `config.rev: '23'` |
+| 旧版运行时 | 0.1.x 不再受支持：0.2.x 移除了 `subagents.start()`、`request.toolFilter`、`request.persona` 与 `agentPresets.standingKeyFor()` |
+
+适配点（实现细节见 `lib/impl.js` 注释）：委派改用 `subagents.startActivation({ provider, label, request, signal, delivery: 'caller' })`；策略安装挂在 `subagent/start` 发布通知上，并在激活返回后按 `childId` 校验、回滚并发错配；工具清单改用 `agentPresets.acquireScope()`；persona 通过在子作用域注册 `deployment:persona-prefix/suffix` 段落实现。
 
 ## 目录结构
 
@@ -58,7 +68,7 @@ Copy-Item "$env:USERPROFILE\.dsh\plugins\dsh-preset-agent-manager\*" $dst -Recur
     - id: preset-agent-manager
       name: 'dsh-preset-agent-manager'
       config:
-        rev: '16'
+        rev: '23'
 ```
 
 ### 卸载 / 停用
@@ -84,18 +94,18 @@ Copy-Item "$env:USERPROFILE\.dsh\plugins\dsh-preset-agent-manager\*" $dst -Recur
 
 ## 机制与保证
 
-- **委派走 DSH 自己的 subagent seam**：`ctx.subagents.start(provider, request)`，provider 取 `spawn`（当前 profile 同时注册 `spawn` 与 `fork`）。子会话是普通子 Agent，拥有自己的 session 与 scope。
-- **禁止嵌套**：`maxDepth: 1`（父 depth 0，子 depth 1，再委派即被 `SubagentDepthError` 拒绝）。白名单与作用域 guard 是第二、三重保证——见下。
+- **委派走 DSH 自己的 subagent seam**：`ctx.subagents.startActivation({ provider, label, request, signal, delivery: 'caller' })`，provider 取 `spawn`（当前 profile 同时注册 `spawn` 与 `fork`）。`delivery: 'caller'` 让结果回到本工具，而不向父会话注入完成通知（否则输出会出现两次）。子会话是普通子 Agent，拥有自己的 session 与 scope。
+- **禁止嵌套**：`maxDepth: 1`（父 depth 0，子 depth 1，再委派即被深度上限拒绝；子会话的运行上下文会直接写明「剩余层级 0」）。白名单 mask 与 guard 是第二、三重保证——见下。
 - **严格白名单语义**（两层，均经实测确认）：
-  1. **继承层掩码** — `toolFilter.allow` 交给 DSH 的 `tools.restrict()`，它过滤该 scope **继承**的一切（全局层 + 全部祖先层），只豁免该 scope **自己**注册的工具。于是被勾选的工具可用，未勾选的（包括全部 agent preset 行注册的工具）在子会话的 prompt 中不存在，调用也会被拒绝。
-  2. **自身层 guard** — 第 1 层按设计豁免了子会话**自身作用域**注册的工具，而委派工具（`subagent`、`subagent_fork`）恰好属于这一类：实测中即使白名单为空，子会话仍能看到 `subagent`。因此主机半在子会话发布后，通过 `child.ctx.tools.guard(...)` 在其作用域内再注册一道单调 guard：不在白名单内的调用一律返回
-     `tool "<name>" is outside preset agent "<id>" plugin whitelist`。实测子会话原文回执该错误，并自报 `tools=0`。`run_code`（PTC 传输而非能力）被显式放行。
-  - `toolFilter.allow` 只接受调用方作用域**继承集**里的名字（该集合≠进程全局视图：host 插件行把工具注册在自己的 scope 里）。因此主机半用 `parent.ctx.tools.schemas()` 解析白名单，无法解析的名字在委派前剔除并写入 `warnings`，不会让委派抛错。
-  - 两层都在子会话自己的作用域内，随子会话销毁；guard 在子会话发布后立即注册，早于模型第一次工具调用（模型首轮往返）数十倍的时间裕度。
+  1. **继承层掩码** — 在子会话作用域内调用 `tools.restrict({ allow, deny })`，它过滤子会话**继承**的一切（全局层 + 全部祖先层，包含所有 agent preset 行注册的工具）。被勾选的工具可用，未勾选的在子会话 prompt 中不存在。
+  2. **自身层 guard** — 第 1 层按设计豁免子会话**自身作用域**注册的工具（如运行时为子代理注入的 `ops_bash`、以及委派工具 `subagent`）。主机半在 `subagent/start` 发布通知里再注册一道单调 guard：不在白名单内的调用一律返回
+     `tool "<name>" is outside preset agent "<id>" plugin whitelist`。实测子会话原文回执该错误。`run_code`（PTC 传输而非能力）被显式放行。
+  - 白名单名字必须能在调用方组合中解析：主机半用父 agent 的作用域键（`scopeOf(parent.ctx)`，回退到 `composedPreset` + `acquireScope`）取真实工具视图，解析不了的名字在委派前剔除并写入 `warnings`，不会让委派抛错。
+  - 两层都在子会话自己的作用域内，随子会话销毁。策略安装时机是 `subagent/start`（子会话发布、首次 prompt 组装之前）；并发委派会串行化发布窗口，并按 `childId` 校验、回滚错配策略。
 - **空白名单是合法配置**：不勾任何工具的预设智能体（纯推理/写作型）正常运行且返回 `success`；只有白名单**丢失了名字**才会降级为 `partial` 并附警告。
-- **隔离与降级**：每个预设智能体在自己的子会话中组装环境，会话结束即销毁；白名单内插件初始化失败**不会中断主会话**，子会话会带着警告继续，`status` 降级为 `partial`。
-- **persona**：作为 per-child persona 注册在子会话 scope 上，只覆盖该子会话，不影响父会话与兄弟会话。
-- **并发**：`preset_agent_dispatch` 声明 `isConcurrencySafe: () => true`，同一预设智能体的多次委派各自独立运行、互不干扰。
+- **隔离与降级**：每个预设智能体在自己的子会话中组装环境，会话结束即销毁。白名单里出现不可解析的名字会降级为 `partial` 并附警告，不会中断主会话。
+- **persona**：在子会话作用域注册 `deployment:persona-prefix` / `deployment:persona-suffix` 段落，遮蔽该子会话的部署 persona，只覆盖该子会话，不影响父会话与兄弟会话。
+- **并发**：`preset_agent_dispatch` 声明 `isConcurrencySafe: () => true`，同一预设智能体的多次委派各自独立运行；仅 `startActivation` 的发布窗口被串行化（毫秒级），子任务执行完全并发。
 - **持久化**：`agents.json` 采用「临时文件 + rename」原子写入，写入串行化；损坏的 JSON 会被旁置为 `agents.json.corrupt-<ts>` 而不是被覆盖。
 
 ## 数据文件
@@ -140,7 +150,8 @@ Copy-Item "$env:USERPROFILE\.dsh\plugins\dsh-preset-agent-manager\*" $dst -Recur
 ## 已知限制
 
 - **没有 pnpm 就无法使用 `dsh plugin add` 的裸包名形式**（取决于环境是否安装 pnpm）。`file:` 路径形式同样需要 pnpm；方式 B 完全绕开。
-- **预设智能体不是 agent preset**：它复用父会话的 preset 组合，靠 `toolFilter` + guard + `maxDepth` 做约束，因此不能授予某个 agent preset 行独有的工具。
+- **预设智能体不是 agent preset**：它复用父会话的 preset 组合，靠子会话作用域内的 `tools.restrict()` + `tools.guard()` + `maxDepth` 做约束。因此不能授予某个 agent preset 行独有的工具——只能从父会话本来就继承的工具集合里挑。
+- **子会话自身作用域注册的工具无法从 prompt 中隐藏**（`tools.restrict()` 按设计只掩码继承层）：典型如运行时注入的 `ops_bash`、以及委派工具 `subagent`。它们会出现在子会话的工具清单里；若被显式加入白名单（例如通过 `preset_agent_admin`），guard 会放行该调用，未加入的调用一律被拒绝并返回原文错误。
 - **面板的插件清单来自 Loader 与 preset 组合**，`fiberPhase: 'failed'` 只有状态位，没有错误堆栈摘要（DSH 当前未提供 entry 级错误读取接口）。
 
 ## License

@@ -387,3 +387,62 @@ Copy-Item "$env:USERPROFILE\.dsh\plugins\dsh-preset-agent-manager\*" $dst -Recur
 ```
 
 `toolWhitelist` 是真正生效的严格白名单；`pluginWhitelist` 记录面板上的选择意图，用于展示与不可用插件告警。
+
+---
+
+## 附录 D：DSH 0.2.1-rc.2 适配实测（host rev 23）
+
+| 项目 | 内容 |
+|---|---|
+| 被测插件 | `dsh-preset-agent-manager` v0.2.0（host 实现 rev 23） |
+| 被测环境 | Windows · DeepSeek Harness 桌面运行时 **0.2.1-rc.2**（`@deepseek-ai/dsh-tools` 0.2.1-rc.2） |
+| Profile | `desktop`（`patchReload: live`；本包经 `dsh.profile.bundles` 挂载，profile patch 覆盖 `config.rev`） |
+| 测试日期 | 2026-10-18 |
+| 关键方法 | 热更新 rev 16 → 23，全程未重启 DSH |
+
+### D.1 为什么需要适配
+
+0.2.x 移除了本插件原先依赖的四处 API：
+
+| 旧实现 | 0.2.1-rc.2 现状 |
+|---|---|
+| `subagents.start(provider, request)` | `subagents.startActivation({ provider, label, request, signal, delivery })`，返回 `{ childId, result, dispose }` |
+| `request.toolFilter` / `request.persona` | 二者已从 `SubagentStartRequest` 移除；`SubagentCapabilities` 也只剩 `agentOptions/agentPreset/outputSchema/depthLimit` |
+| `agentPresets.standingKeyFor(id)` | `agentPresets.acquireScope(id)`（引用计数租约，取 `key` 读作用域工具视图） |
+| 事件 `subagent/start` 作为 childId 来源 | 仍存在，且 `ctx.agents.get(info.id)` 在通知内可解析——被用作策略安装时机 |
+
+### D.2 实测用例
+
+| 编号 | 验收项 | 状态 | 证据 |
+|---|---|---|---|
+| A1 | 热更新加载 | ✅ | `boot.log`：`shell: apply start (rev=23)` → `impl: apply done` → `route claimed through effect` |
+| A2 | 面板工具清单完整 | ✅ | `GET /preset-agents-api/state` 200；工具 **48 个**，含 `read`/`write`/`edit`/`glob`/`grep`/`pwsh`/`web_*`/`subagent_fork` 及 `preset:*` 作用域标注 |
+| A3 | 面板写入路径 | ✅ | `POST /agents`（客户端同款 camelCase `toolWhitelist`）→ `toolWhitelist` 正确回读；`POST /agents/delete` 返回 `runningChildren: []` |
+| B1 | 空白名单委派 | ✅ | `status=success`，子会话正常运行 |
+| B2 | persona 遮蔽 | ✅ | 子会话自称「青色鲸鱼」（部署 persona 未出现） |
+| B3 | 白名单掩码 | ✅ | 白名单 `[ops_glob, read]` 的子会话自报工具：`ops_bash`、`ops_glob`、`read`、`subagent` |
+| B4 | 白名单内工具可调用 | ✅ | `ops_glob`、`read` 均返回真实结果 |
+| B5 | 非白名单继承工具不可见 | ✅ | 同一子会话清单中没有 `write`/`pwsh`/`grep` 等 preset 行工具 |
+| B6 | 自身作用域工具被拒 | ✅ | 原文回执 `Error: tool "ops_bash" is outside preset agent "probe-ops" plugin whitelist` |
+| B7 | 空白名单子会话无继承工具 | ✅ | 仅剩 `ops_bash`、`subagent` 两个自身作用域工具，调用均被 guard 拒绝 |
+| B8 | 自身作用域工具显式白名单后可调用 | ✅ | 白名单 `[ops_bash]`：mask 无法隐藏它，但 guard 放行，`echo SCOPE_OK` 真实返回；mask 其余部分正常生效 |
+| C1 | 禁止嵌套 | ✅ | 子会话运行上下文直接标注「current 1, maximum 1, remaining levels 0」，模型未发起嵌套调用 |
+| D1 | 并发不串策略 | ✅ | 同一消息内并发派发两个不同预设智能体，各自工具清单与 persona 正确 |
+| D2 | 并发错配回滚分支 | 🟡 | 代码路径已实现（按 `childId` 校验 + disposer 回滚），未构造「父会话同时调用内置 `subagent` 工具」的真实冲突 |
+| E1 | 持久化 | ✅ | 测试后 `agents.json` 原子写回 `{"version":1,"agents":[]}` |
+
+### D.3 适配后的实现要点
+
+1. `delivery: 'caller'`：结果回到 `preset_agent_dispatch` 自己的工具结果，不向父会话注入完成通知（否则同一输出会出现两次）。
+2. 策略安装时机：`subagent/start` 通知内（子会话已发布、首次 prompt 组装之前）调用 `child.ctx.tools.restrict()` + `tools.guard()` + `systemPrompt.section()`；晚于 `startActivation()` 返回会输掉与首次 prompt 组装的竞速。
+3. 并发安全：`subagent/start` 不携带 label，故串行化发布窗口；激活返回后按 `childId` 校验，把错配到其他子会话的策略用 disposer 回滚。
+4. 工具清单：`agentPresets.acquireScope(id)` 取 `key` → `tools.schemas(key)`，读完释放租约；失败写入 `diagnostics` 而不是静默吞掉。
+5. mask 容错：`tools.restrict()` 遇到一个不可掩码的名字（子会话自身作用域注册的工具）会整段拒绝。实现先整体尝试，失败后逐名探测、只把可掩码的名字放进 mask，guard 仍按完整白名单放行。
+6. 诊断：`boot.log` 记录 `scopeOf available/unavailable`、`grantable tool names: N (parent scope contributed M)`、每次委派的 `allow` 解析结果。
+
+### D.4 已知限制（实测确认）
+
+- 子会话**自身作用域**注册的工具（`ops_bash`、`subagent`）无法从 prompt 中隐藏——`tools.restrict()` 按设计只掩码继承层；它们会出现在清单里。若显式加入白名单（如经 `preset_agent_admin`），guard 放行该调用；未加入的调用一律被拒绝并返回原文错误。
+- 子会话的工具清单里仍可能看到 `subagent`，但深度上限会先一步阻止嵌套，且 guard 兜底。
+- 面板视觉未在浏览器内逐项点击验证；已确认两个槽位占用者 `active`、面板 API 200 且读写路径可用。
+
